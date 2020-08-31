@@ -4,38 +4,31 @@ import asyncio
 from time import time
 from heapq import heappop, heappush
 
+from telethon.sync import TelegramClient
+from telethon import errors as mt_errors
+
 import keyring
 from heidi import delivery
-from heidi.ex import ServerError
-from heidi.util import init_redis, init_data_layer, fetch
+from heidi.util import init_redis, init_data_layer
 
 TELEGRAM = 'telegram'
-access_token = keyring.get_password(TELEGRAM, 'heidi')
-SEND_MESSAGE_URL = f'https://api.telegram.org/bot{access_token}/sendMessage'
-RATE_LIMIT_ERRORS = {
-    'FLOOD_WAIT_': True,
-    'SLOWMODE_WAIT_': False,
-}
+bot_token = keyring.get_password(f'{TELEGRAM}-token', 'heidi')
+api_hash = keyring.get_password(f'{TELEGRAM}-api-hash', 'heidi')
+api_id = keyring.get_password(f'{TELEGRAM}-api-id', 'heidi')
 
+WAIT_THRESHOLD = 60
 
-def evaluate(response):
-    # i.e. on success or connection / server errors.
-    if 'error_code' not in response:
-        return False, False, 0, 0
-
-    error = response['description']
-    has_error, worth_trying, global_cd, user_cd = True, False, 0, 0
-
-    for desciption, is_global in RATE_LIMIT_ERRORS.items():
-        if error.startswith(desciption):
-            worth_trying = True
-
-            cd_value = int(error.split('_')[-1])
-            if is_global:
-                global_cd = cd_value
-            else:
-                user_cd = cd_value
-    return has_error, worth_trying, global_cd, user_cd
+client = TelegramClient(
+    None,
+    api_id,
+    api_hash,
+    # Server [>=500] errors only.
+    request_retries=10,
+    # `telethon` will sleep accordingly for
+    # X | 0 < FLOOD_WAIT_X <= WAIT_THRESHOLD
+    # and raise `mt_errors.FloodWaitError` otherwise.
+    flood_sleep_threshold=WAIT_THRESHOLD,
+).start(bot_token=bot_token)
 
 
 async def process_batch(task, redis):
@@ -43,17 +36,17 @@ async def process_batch(task, redis):
 
     telegram_ids, telegram_to_heidi = set(), {}
     for heidi_id, values in contacts.items():
-        for telegram_id in values:
+        # Heidi stores contact values as strings.
+        for telegram_id in map(int, values):
             telegram_ids.add(telegram_id)
             telegram_to_heidi[telegram_id] = heidi_id
 
     delivered_to = []
+
     # Telegram does not provide bulk notifications API.
     queue = [(0, telegram_id, 0) for telegram_id in telegram_ids]
     while queue:
-        # `heapq` is a binary min-heap implementation using the first tuple
-        # item as a priority.
-        try_count, telegram_id, user_lock = heappop(queue)
+        user_lock, telegram_id, try_count = heappop(queue)
         if try_count > 5:
             continue
 
@@ -61,33 +54,21 @@ async def process_batch(task, redis):
         if delta > 0:
             await asyncio.sleep(delta)
 
-        payload = {
-            'chat_id': telegram_id,
-            'text': history.text,
-        }
-
-        # Otherwise we will get interpreter error if the try-except block
-        # below has been hit.
-        response = None
         try:
-            response = await fetch('POST', SEND_MESSAGE_URL, json=payload)
-        except (ConnectionError, ServerError):
-            # Giving the access network / Telegram API some time to recover.
+            await client.send_message(telegram_id, history.text)
+            delivered_to.append(telegram_to_heidi[telegram_id])
+            continue
+        except mt_errors.SlowModeWaitError as user_cooldown:
+            user_lock = time() + user_cooldown.seconds
+            if user_lock > WAIT_THRESHOLD:
+                continue
+        except mt_errors.FloodWaitError:
+            break  # @see `client` initialization
+        except OSError:
+            # Giving the access network some time to recover.
             await asyncio.sleep(1)
 
-        # Telegram implements both per user and per application cooldowns.
-        has_error, worth_trying, global_cd, user_cd = evaluate(response)
-        if not has_error:
-            delivered_to.append(telegram_to_heidi[telegram_id])
-
-        if not worth_trying:
-            continue
-
-        if global_cd > 0:
-            await asyncio.sleep(global_cd)
-
-        user_lock = time() + user_cd if user_cd > 0 else 0
-        heappush(queue, (try_count + 1, telegram_id, user_lock))
+        heappush(queue, (user_lock, telegram_id, try_count + 1))
 
     await delivery.update_status(history_key, TELEGRAM, delivered_to, redis)
 
