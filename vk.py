@@ -4,6 +4,7 @@ import asyncio
 
 from more_itertools import chunked, flatten
 
+import random
 import keyring
 from heidi import delivery
 from heidi.ex import ServerError
@@ -41,10 +42,15 @@ SEND_SCRIPT_TEMPLATE = \
     return result;'''
 
 
-def compile_send_scripts(vk_ids, text, random_id):
+def compile_send_scripts(vk_ids, text):
+    # Users won't receive messages sharing the same `random_id`
+    # more than once in a couple of hours.
+    random_id = random.randint(1, 2**42)
+
     # 1. `execute` script may contain up to 25 API requests;
     # 2. `messages.send` request may contain up to 100 user ids.
     scripts = []
+
     for execute_chunk in chunked(vk_ids, 2500):
         send_chunks = list(chunked(execute_chunk, 100))
         scripts.append(SEND_SCRIPT_TEMPLATE %
@@ -77,9 +83,7 @@ async def process_batch(task, redis):
 
     delivered_to = []
 
-    # Users won't receive messages sharing the same `random_id`
-    # more than once in a couple of hours.
-    for script in compile_send_scripts(vk_ids, history.text, random_id=2**42):
+    for script in compile_send_scripts(vk_ids, history.text):
         # Each `messages.send` response contains a list a previously sent
         # messages with the same `random_id`.
         try_count, response = 0, None
